@@ -108,32 +108,9 @@ struct jit_brgemm_amx_uker_t : public brgemm_kernel_t {
                     brg.attr()->post_ops_, bsp, esp,
                     /* inject_sum = */ brg.with_sum);
 
-            using namespace dnnl::impl::cpu::binary_injector_utils;
-            std::tie(with_binary_per_oc_bcast_, with_binary_per_oc_sp_bcast_,
-                    with_binary_per_oc_d_bcast_, with_binary_per_mb_bcast_,
-                    with_binary_channel_bcast_, with_binary_per_mb_w_bcast_,
-                    with_binary_per_w_bcast_, with_binary_per_hw_bcast_,
-                    with_binary_batch_bcast_, with_binary_spatial_bcast_,
-                    with_binary_no_bcast_)
-                    = bcast_strategies_present_tup(brg.attr()->post_ops_.entry_,
-                            dst_md_wrapper, broadcasting_strategy_t::per_oc,
-                            broadcasting_strategy_t::per_oc_spatial,
-                            broadcasting_strategy_t::per_oc_d,
-                            broadcasting_strategy_t::per_mb,
-                            broadcasting_strategy_t::per_mb_spatial,
-                            broadcasting_strategy_t::per_mb_w,
-                            broadcasting_strategy_t::per_w,
-                            broadcasting_strategy_t::per_hw,
-                            broadcasting_strategy_t::batch,
-                            broadcasting_strategy_t::spatial,
-                            broadcasting_strategy_t::no_broadcast);
-            handle_binary_po_offset_ = with_binary_per_oc_bcast_
-                    || with_binary_per_oc_sp_bcast_
-                    || with_binary_per_oc_d_bcast_ || with_binary_per_mb_bcast_
-                    || with_binary_channel_bcast_ || with_binary_per_mb_w_bcast_
-                    || with_binary_per_w_bcast_ || with_binary_per_hw_bcast_
-                    || with_binary_batch_bcast_ || with_binary_spatial_bcast_
-                    || with_binary_no_bcast_;
+            handle_binary_po_offset_ = binary_injector::
+                    any_binary_postop_rhs_non_scalar_broadcast(
+                            brg.attr()->post_ops_, dst_md_wrapper);
         }
         use_ils_ = brg.brgattr.use_interleave_stores && !brg.is_ace();
     }
@@ -164,8 +141,7 @@ private:
     const reg64_savable_t reg_iter_labels_list {regscratchpad_, rax, r16};
 
     const reg64_t reg_addr_batch = r13;
-    const reg64_savable_t reg_aux1_batch {
-            regscratchpad_, rbx, rbp, may_use_rbp()};
+    const reg64_savable_t reg_aux1_batch {regscratchpad_, rbx};
     const reg64_savable_t reg_A {regscratchpad_, r11};
     const reg64_savable_t reg_B {regscratchpad_, r10};
     const reg64_t reg_stride_lda = r14;
@@ -174,7 +150,6 @@ private:
     const reg64_savable_t reg_D {regscratchpad_, r12};
 
     const reg64_savable_t reg_buf {regscratchpad_, r8};
-    const reg64_t reg_BS = rbx;
     const reg64_t reg_BS_loop = r9;
     const reg64_savable_t reg_bias {regscratchpad_, rbx};
     const reg64_savable_t reg_bias_backup {regscratchpad_, rbx};
@@ -204,17 +179,6 @@ private:
     bool may_load_accumulators_ = false;
 
     bool handle_binary_po_offset_ = false;
-    bool with_binary_per_oc_bcast_ = false;
-    bool with_binary_per_oc_sp_bcast_ = false;
-    bool with_binary_per_oc_d_bcast_ = false;
-    bool with_binary_channel_bcast_ = false;
-    bool with_binary_per_mb_bcast_ = false;
-    bool with_binary_per_mb_w_bcast_ = false;
-    bool with_binary_per_w_bcast_ = false;
-    bool with_binary_batch_bcast_ = false;
-    bool with_binary_spatial_bcast_ = false;
-    bool with_binary_per_hw_bcast_ = false;
-    bool with_binary_no_bcast_ = false;
     bool prepare_post_ops_registers_once_ = false;
 
     const char *bd_mask_buffer_ptr_ = nullptr;
@@ -240,7 +204,6 @@ private:
     dim_t ldb_tail_B_size_ = 0;
     dim_t ldb_tail_C_size_ = 0;
     dim_t ldb_tail_D_size_ = 0;
-    dim_t ldb_tail_zp_size_ = 0;
 
     enum matrix_kind_t { matrix_A, matrix_B, matrix_C, matrix_D };
 
@@ -971,8 +934,7 @@ dim_t jit_brgemm_amx_uker_t::zp_comp_b_offset(dim_t bd) const noexcept {
 dim_t jit_brgemm_amx_uker_t::zp_c_values_offset(
         brgemm_iteration_t &bi, int ldb) const noexcept {
     if (brg.zp_type_c == brgemm_broadcast_t::per_n) {
-        return (bi.ldi->is_tail(ldb)) ? ldb_tail_zp_size_
-                                      : bi.ldi->pos(ldb) * ld_block_zp_size_;
+        return bi.ldi->pos(ldb) * ld_block_zp_size_;
     }
 
     return 0;
@@ -1040,8 +1002,6 @@ void jit_brgemm_amx_uker_t::cvt2ps(data_type_t type_in,
 
 void jit_brgemm_amx_uker_t::read_params() {
     Label label_done;
-
-    mov(reg_BS, ptr[param1 + GET_OFF(BS)]);
 
     mov(reg_addr_batch, ptr[param1 + GET_OFF(batch)]);
 
@@ -2540,7 +2500,7 @@ void jit_brgemm_amx_uker_t::maybe_pre_process_data(brgemm_iteration_t &bi,
     auto &transform_buf = is_A ? transform_buf_map_A_ : transform_buf_map_B_;
 
     const auto transform_offset
-            = use_ils_ ? brg.get_num_C_tiles() * brgemm_desc_t::tilesize : 0;
+            = brg.get_num_C_tiles() * brgemm_desc_t::tilesize;
     const auto max_bdb2 = tloop.bdis[0].block2();
     const auto max_rdb = tloop.rdis.size();
     const auto matrix_a_offset = transform_offset;
@@ -2813,10 +2773,6 @@ void jit_brgemm_amx_uker_t::ace_load_B(
     const auto start_rdstep = (rdstep == -1) ? 0 : rdstep;
     const auto finish_rdstep
             = (rdstep == -1) ? ace_rd_steps(bi.rdi->block(0)) : rdstep + 1;
-    // EVEX_compress_addr uses rbp (= reg_aux1_batch) as a scale multiplier
-    // for offsets >= 0x200. Since rbp holds a live batch pointer during the
-    // microkernel, we must not let it be used as an address component.
-    // Pre-add the base offset to reg_tmp_gpr and use small per-rds offsets.
     const dim_t rds_stride = brg.rd_step * LDB_size_;
     // When called with a specific rdstep (n_bcast_1_load=true path), the
     // caller passes B_offset for the ldb block but does not advance for the
@@ -2824,8 +2780,6 @@ void jit_brgemm_amx_uker_t::ace_load_B(
     // the correct row of B (not always row 0).
     const dim_t effective_offset
             = offset + (rdstep == -1 ? 0 : rdstep * rds_stride);
-    const bool needs_base_fixup = (effective_offset >= EVEX_max_8b_offt);
-    if (needs_base_fixup) { lea(reg_tmp_gpr, ptr[reg_B + effective_offset]); }
     for (int rds = start_rdstep; rds < finish_rdstep; rds++) {
         // if rdstep != -1 , then (rds - start_rdstep) should be 0
         auto zmm = ace_zmm_B(ldb, rds - start_rdstep);
@@ -2835,13 +2789,8 @@ void jit_brgemm_amx_uker_t::ace_load_B(
         // the B register, and ld_tail_mask has one bit per element. A
         // qword-granular load would fetch twice the tail bytes and can read
         // past the end of B.
-        if (needs_base_fixup) {
-            vmovups(zmm | k_mask | T_z,
-                    EVEX_compress_addr(reg_tmp_gpr, rds_off));
-        } else {
-            vmovups(zmm | k_mask | T_z,
-                    EVEX_compress_addr(reg_B, effective_offset + rds_off));
-        }
+        vmovups(zmm | k_mask | T_z,
+                EVEX_compress_addr(reg_B, effective_offset + rds_off));
     }
 }
 
@@ -3025,7 +2974,7 @@ void jit_brgemm_amx_uker_t::bs_loop(brgemm_iteration_t &bi) {
             Label BS_loop_label, end_BS_loop_label, first_BS_loop_label,
                     last_BS_loop_label;
 
-            mov(reg_BS_loop, reg_BS);
+            mov(reg_BS_loop, ptr[param1 + GET_OFF(BS)]);
             cmp(reg_BS_loop, 0);
             jz(end_BS_loop_label, T_NEAR);
 
@@ -3548,7 +3497,6 @@ void jit_brgemm_amx_uker_t::generate() {
     ldb_tail_B_size_ = static_cast<dim_t>(brg.typesize_B) * brg.ldb_tail;
     ldb_tail_C_size_ = static_cast<dim_t>(brg.typesize_C) * brg.ldb_tail;
     ldb_tail_D_size_ = static_cast<dim_t>(brg.typesize_D) * brg.ldb_tail;
-    ldb_tail_zp_size_ = static_cast<dim_t>(sizeof(int32_t)) * brg.ldb_tail;
 
     // if beta == 1 and C datatype is f32 it is better to perform addition by
     // reading tiles directly from C instead of by reading/writing by vectors

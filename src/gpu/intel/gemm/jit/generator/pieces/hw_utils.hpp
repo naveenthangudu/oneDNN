@@ -38,7 +38,11 @@ static inline constexpr int elementsPerGRF(ngen::HW hw, Type T)
 
 static inline constexpr int elementsPerGRF(ngen::HW hw, ngen::DataType dt)
 {
-    return (ngen::GRF::bytes(hw) << 3) >> getLog2Bits(dt);
+    // u3 (Type::ngen_u3()) has a 3-bit element width, which is not a power of
+    // two and thus has no valid getLog2Bits() encoding; compute directly via
+    // division instead (mirroring Type::operator/ for sub-byte types).
+    return (dt == Type::ngen_u3()) ? (ngen::GRF::bytes(hw) << 3) / 3
+                                   : (ngen::GRF::bytes(hw) << 3) >> getLog2Bits(dt);
 }
 
 static inline bool canSwizzle(ngen::HW hw, ngen::DataType dt)
@@ -81,10 +85,10 @@ static inline bool hasNativeAtomicAdd(ngen::HW hw, Type T, const MatrixAddressin
         return true;
     else if (T == Type::f32)
         return floatAtomics && (hw >= HW::XeHP);
-    else if (T == Type::f16 || T == Type::bf16)
-        return (hw >= HW::Xe3p);
     else if (T == Type::f64)
         return floatAtomics && (hw >= HW::XeHPC);
+    else if (T == Type::f16 || T == Type::bf16)
+        return (hw >= HW::Xe3p);
     else
         return false;
 }
@@ -126,8 +130,8 @@ static inline int eusPerSubslice(ngen::HW hw)
     switch (hw) {
         case HW::XeHPC:
         case HW::Xe2:
-        case HW::Xe3p:
         case HW::Xe3:
+        case HW::Xe3p:
             return 8;
         case HW::Gen12LP:
         case HW::XeHP:

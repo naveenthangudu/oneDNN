@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2024 Intel Corporation
+* Copyright 2026 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,30 +14,22 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "cpu/reorder/cpu_reorder.hpp"
+#include "gpu/intel/primitive_attr.hpp"
 
-namespace dnnl {
-namespace impl {
-namespace cpu {
+#include "common/c_types_map.hpp"
+#include "common/utils.hpp"
 
-// clang-format off
+using namespace dnnl::impl;
+using namespace dnnl::impl::gpu::intel;
 
-const impl_list_map_t &regular_fp4_impl_list_map() {
-    static const impl_list_map_t the_map = REG_REORDER_P({
-        {{f32, f4_e2m1, 0}, {
-            CPU_INSTANCE(ref_reorder_t)
-            nullptr,
-        }},
-        {{f4_e2m1, data_type::undef, 0}, {
-            CPU_INSTANCE(ref_reorder_t)
-            nullptr,
-        }},
-    });
-    return the_map;
+#ifdef DNNL_DEV_MODE
+extern "C" dnnl_status_t DNNL_API dnnl_impl_gpu_intel_set_kernel_override(
+        primitive_attr_t *attr, const char *kernel) {
+    if (utils::any_null(attr)) return status::invalid_arguments;
+
+    if (!attr->gpu_attr_) CHECK(attr->set_gpu_attr(gpu_primitive_attr_t()));
+    utils::downcast<gpu_primitive_attr_t *>(attr->gpu_attr_.get())
+            ->set_kernel_override(kernel ? kernel : "");
+    return status::success;
 }
-
-// clang-format on
-
-} // namespace cpu
-} // namespace impl
-} // namespace dnnl
+#endif // DNNL_DEV_MODE

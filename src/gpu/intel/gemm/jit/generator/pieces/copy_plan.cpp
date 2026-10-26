@@ -251,6 +251,7 @@ void CopyPlan::transform()
     distributePhases();
     planEarlySubByteIntUpconversions();
     split2DRegions();
+    planEarlyInt3Upconversions();
 
     sort(SortType::Register);
 
@@ -289,7 +290,6 @@ void CopyPlan::transform()
     optimizeWriteSpread();
 
     legalizeImmediateTypes();
-    legalizeDstStrides();
 
     sort(SortType::PhaseOnly);
 
@@ -569,7 +569,7 @@ void CopyPlan::copyThrough(CopyInstruction &i, DataType type, int stride, bool s
 {
     auto st = i.src0.type, dt = i.dst.type;
     auto sstride = i.src0.stride, dstride = i.dst.stride;
-    auto ssize = getBytes(st), dsize = getBytes(dt), isize = getBytes(type);
+    auto ssize = getBits(st), dsize = getBits(dt), isize = getBits(type);
 
     auto &i0 = i, &i1 = split(i);
 
@@ -615,19 +615,7 @@ void CopyPlan::copyThrough(CopyInstruction &i, DataType type, int stride, bool s
         // No space for in-place conversion -- create temporary.
         if (stride == 0)
             stride = std::max(1, ssize * sstride / isize);
-        int offset = 0;
-        auto tryOffset = [&](const CopyOperand &op) {
-            if (op.byteStride() == isize * stride) {
-                auto bo = op.byteOffset();
-                if (bo < GRF::bytes(hw) - stride * getBytes(type) * (i.simd - 1))
-                    offset = bo / isize;
-            }
-        };
-        if (isize <= dsize) tryOffset(i1.dst.byteOffset());
-        if (isize <= ssize) tryOffset(i0.src0.byteOffset());
-        if (type == DataType::hf)
-            offset &= ~1;
-        i0.dst = newTemp(type, i.simd, stride, 0, offset);
+        i0.dst = newTemp(type, i.simd, stride);
         i1.src0 = i0.dst;
         i1.src0.overwriteStride = true;
 
@@ -657,6 +645,7 @@ void CopyPlan::copyThrough(CopyInstruction &i, DataType type, int stride, bool s
     auto setNullDstRegioning = [](CopyOperand &dst, const CopyOperand &src) {
         if (!dst.isNull()) return;
         dst.stride = src.width == 1 ? src.vs : src.stride;
+        dst.offset = src.offset;
         dst.width = dst.vs = 0;
         dst.type = src.type;
     };
@@ -727,6 +716,7 @@ void CopyPlan::repositionSrc(CopyInstruction &i, int n, int stride, int offset)
 
     if (!i1.dst) {
         i1.dst.stride = i1.src0.width == 1 ? i1.src0.vs : i1.src0.stride;
+        i1.dst.offset = i1.src0.offset;
         i1.dst.width = i1.dst.vs = 0;
         i1.dst.type = i1.src0.type;
     }
@@ -880,6 +870,8 @@ void CopyPlan::planTypeConversions()
             stub("Unsupported move to 4-bit type");
         else if (isInt2(dt))
             stub("Unsupported move to 2-bit type");
+        else if (isInt3(dt))
+            stub("Unsupported move to 3-bit type");
         else if (isB(st) && getBytes(dt) == 8)
             copyThrough(i, DataType::w);
         else if (getBytes(st) == 8 && isB(dt))
@@ -896,6 +888,9 @@ void CopyPlan::planTypeConversions()
             planInt8ToHF(i);
         else if (isB(st) && dt == DataType::bf) {
             planInt8ToBF(i);
+            rerun = true;
+        } else if (isB(st) && dt == DataType::f && needsByteFloatWorkaround()) {
+            copyThrough(i, DataType::d);
             rerun = true;
         } else if (st == DataType::f && dt == DataType::tf32) {
             if (hw < HW::XeHPC)
@@ -1113,53 +1108,6 @@ void CopyPlan::legalizeShfl()
     }
 }
 
-// Example case requiring this transformation:
-// --matmul --engine=gpu --dt=f16:u2:f16 --wtag=ba --attr-zero-points=wei:per_oc:u2 --attr-fpmath=f16:true 1x5120:5120x7680
-void CopyPlan::legalizeDstStrides()
-{
-    for (auto &i: insns) {
-        bool disaggregate = false;
-        if (i.dst.type != DataType::uw)
-            continue;
-        // dst stride can only go up to 4. If 8, switch to ud
-        if (i.dst.stride > 4) {
-            if (i.dst.stride > 8) {
-                disaggregate = true;
-            }
-            if (i.dst.offset % 2 != 0) {
-                disaggregate = true;
-            }
-            if (!i.dst.overwriteStride) {
-                disaggregate = true;
-            }
-            if (!disaggregate) {
-                i.dst.offset /= 2;
-                i.dst.stride /= 2;
-                i.dst.type = DataType::ud;
-            } else {
-                for (int k = 0; k < i.simd; k++) {
-                    auto &i1 = split(i, false);
-                    i1.dst.offset += k * i.dst.stride;
-                    i1.dst.stride = 1;
-                    i1.src0.offset += k * i.src0.stride;
-                    i1.src0.stride = 1;
-                    if (!i1.src1.isNull()) {
-                        i1.src1.offset += k * i.src1.stride;
-                        i1.src1.stride = 1;
-                    }
-                    if (!i1.src2.isNull()) {
-                        i1.src2.offset += k * i.src2.stride;
-                        i1.src2.stride = 1;
-                    }
-                    i1.simd = 1;
-                }
-                i.invalidate();
-            }
-        }
-    }
-    mergeChanges();
-}
-
 // Unpack 4-bit src type into 16 bits (zero extended), used in many conversion sequences.
 void CopyPlan::planUnpack4To16(CopyInstruction &i)
 {
@@ -1335,7 +1283,6 @@ CopyOperand CopyPlan::bfImmediate(uint16_t bits, bool ternary)
         return imm;
     }
 };
-
 
 // {b,ub}->bf sequence.
 void CopyPlan::planInt8ToBF(CopyInstruction &i)
@@ -1575,6 +1522,266 @@ void CopyPlan::planInt2Upconversion(CopyInstruction &i)
             i1.src1 = 0x3;
         }
     }
+}
+
+// Lower u3 copies before generic passes interpret their register regions.
+void CopyPlan::planEarlyInt3Upconversions()
+{
+    for (auto &i : insns)
+        if (i.src0.type == Type::ngen_u3()) {
+            if (i.op != Opcode::mov) stub("Unsupported u3 copy operation.");
+            planInt3Upconvert(i);
+        }
+    mergeChanges();
+}
+
+// Rewrite u3 -> int upconversion using byte operations.
+//
+// Eight u3 values are packed into 3 bytes (24 bits), laid out as three
+// "rows" of source bytes (row pitch and column pitch come from
+// CopyInstruction::u3Regioning). Lane k occupies bits [3k, 3k+3) of the
+// 24-bit group:
+//   - lanes 0,1,3,4,6,7 lie entirely within one byte: a single shr by the
+//     lane's bit offset extracts them.
+//   - lanes 2 and 5 straddle a byte boundary: the low bits come from a shr of
+//     the lower byte, the high bits from a shl of the next byte, and the two
+//     parts are combined with or_.
+// Lanes 0/1 and 6/7 share a source row, so when the destination stride is 2
+// they are merged into a single shr with a packed pair of shift immediates.
+// Each lane is written to its (possibly interleaved) destination position.
+// Finally, one and_ with 0x7 clears the leftover high bits of all unpacked
+// elements at once, and, for non-integer (hf/bf) destinations, a converting
+// mov turns the masked uw values into the final type.
+//
+// Example (dst stride 1, integer dst, simplified):
+//    shr  dst[0]  row0  0
+//    shr  dst[1]  row0  3
+//    shr  tmp     row0  6;  shl  tmpHi  row1  2;  or_  dst[2]  tmp  tmpHi
+//    ...
+//    and  dst[0-7]  dst[0-7]  0x7
+//
+void CopyPlan::planInt3Upconvert(CopyInstruction &i)
+{
+    if (i.src0.neg || i.hasCMod()) stub("Unsupported modifier");
+
+    struct U3Lane {
+        uint8_t byte, shift;        // low (or only) source row and shift amount
+        uint8_t hiByte, hiShift;    // high source row and shift amount, if straddling
+        bool straddle;
+    };
+    static const U3Lane lanes[8] = {
+        {0, 0, 0, 0, false},
+        {0, 3, 0, 0, false},
+        {0, 6, 1, 2, true},
+        {1, 1, 0, 0, false},
+        {1, 4, 0, 0, false},
+        {1, 7, 2, 1, true},
+        {2, 2, 0, 0, false},
+        {2, 5, 0, 0, false},
+    };
+
+    int n = i.simd;
+    if (n <= 0) stub("u3 upconversion requires a positive SIMD width.");
+    int grfBytes = GRF::bytes(hw);
+
+    // Integer destinations can be written directly; non-integer (hf/bf)
+    // destinations go through a raw-uw reinterpretation + converting mov.
+    bool directWrite = isInt(i.dst.type);
+    // Preserve the caller-requested dst stride (e.g. crosspack-2).
+    CopyOperand finalDst = i.dst;
+
+    CopyOperand srcBase = i.src0;
+    srcBase.type = DataType::ub;
+
+    if (i.u3Regioning.columnPitchBytes <= 1 || i.u3Regioning.rowPitchBytes <= 0)
+        stub("u3 upconversion requires row-spread regioning data.");
+
+    int nLocal = n;
+    int colPitchBytes = i.u3Regioning.columnPitchBytes;
+    int byteStep = 1;
+    int rowStrideBytes = i.u3Regioning.rowPitchBytes;
+
+    // Add a byte offset, handling column-quad overflow (wraps to the
+    // next row) and overflow into subsequent GRF registers.
+    auto addByteOffset = [&](CopyOperand op, int bytes) {
+        if ((op.offset % colPitchBytes + bytes) >= colPitchBytes)
+            op.offset = op.offset - (op.offset % colPitchBytes)
+                    + (op.offset % colPitchBytes + bytes) % colPitchBytes
+                    + rowStrideBytes;
+        else
+            op.offset += bytes;
+
+        int grfOffset = op.offset / grfBytes;
+        op.grf += grfOffset;
+        op.offset -= grfOffset * grfBytes;
+        return op;
+    };
+
+    // Lane pairs (0,1)/(6,7) share a row and can merge into one shr when
+    // dstStride == 2; otherwise all 8 lanes are processed individually.
+    constexpr int laneOps = 12;
+    // Trailing and_ mask + optional converting mov need 2 more slots.
+    constexpr int extraOps = 2;
+    constexpr int totalOps = laneOps + extraOps;
+
+    // split()/splitMultiple() push into `newInsns`, so reserve first.
+    int nOpsNeeded = totalOps;
+    newInsns.reserve(newInsns.size() + nOpsNeeded - 1);
+
+    auto setOp = [&](CopyInstruction *ci, Opcode op, int simd, const CopyOperand &d, const CopyOperand &s0, const CopyOperand &s1) {
+        ci->op = op;
+        ci->simd = simd;
+        ci->dst = d;
+        ci->src0 = s0;
+        ci->src1 = s1;
+        ci->src2 = CopyOperand();
+        ci->sat = false;
+        ci->cmod = ConditionModifier::none;
+    };
+
+    int type_size = getBytes(finalDst.type);
+    int dstStride = finalDst.stride;
+    switch (type_size) {
+        case 1:
+        case 2:
+        case 4: break;
+        default: stub("Unsupported dst type size for u3 upconversion.");
+    }
+
+    // Row-spread u3 sources are unpacked in a single pass: columns are
+    // stride-4 (crosspack-4) and rows are 1 byte apart.
+    CopyOperand rows[3];
+    rows[0] = srcBase;
+    rows[1] = addByteOffset(srcBase, byteStep);
+    rows[2] = addByteOffset(srcBase, 2 * byteStep);
+    for (auto &r : rows) r.stride = colPitchBytes;
+
+    // Straddling lanes need lo/hi scratch for their shift/or sequence.
+    auto tmp = newTemp(DataType::uw, nLocal, 2);
+    auto tmpHi = newTemp(DataType::uw, nLocal, 2);
+
+    std::vector<CopyInstruction*> allOps;
+    {
+        auto ops = splitMultiple<totalOps>(i);
+        allOps.assign(ops.begin(), ops.end());
+    }
+
+    int next = 0;
+
+    // Compute lane's destination region, interleaved with its pair
+    // partner's at stride dstStride (crosspack).
+    auto computeFinalDstLane = [&](int lane) {
+        int pairIdx = lane / dstStride;
+        int parity  = lane % dstStride;
+        auto fd = finalDst;
+        fd.stride = dstStride;
+        fd.offset += pairIdx * nLocal * fd.stride + parity;
+        int grfOffset = (fd.offset * type_size) / grfBytes;
+        fd.grf += grfOffset;
+        fd.offset -= ((grfOffset * grfBytes) / type_size);
+        if (!directWrite) fd.type = DataType::uw;
+        return fd;
+    };
+
+    // Element-index gap between two GRF-normalized lane destinations.
+    auto elemIndex = [&](const CopyOperand &op) {
+        return (int64_t) op.grf * (grfBytes / type_size) + op.offset;
+    };
+
+    // Merge two non-straddling lanes sharing a source row into one
+    // SIMD-2*nLocal shr using a packed shift immediate.
+    auto mergeRowPair = [&](int laneA, int laneB, CopyInstruction *shrOp) {
+        const auto &LA = lanes[laneA];
+        const auto &LB = lanes[laneB];
+        const auto &rowLo = rows[LA.byte];
+
+        auto dstA = computeFinalDstLane(laneA);
+        auto dstB = computeFinalDstLane(laneB);
+        int hstride = int(elemIndex(dstB) - elemIndex(dstA));
+
+        auto dstMerged = dstA;
+        dstMerged.width = 2;
+        dstMerged.stride = hstride;
+        dstMerged.vs = dstStride;
+
+        auto rowDup = rowLo;
+        rowDup.width = 2;
+        rowDup.vs = rowLo.stride;
+        rowDup.stride = 0;
+
+        CopyOperand shiftLo(int(LA.shift)), shiftHi(int(LB.shift));
+        shiftLo.type = shiftHi.type = DataType::uw;
+        CopyOperand packedShift;
+        packedShift = zipImmediates(shiftLo, shiftHi, 1);
+        if (!packedShift) stub("Failed to pack u3 shift immediates.");
+
+        setOp(shrOp, Opcode::shr, 2 * nLocal, dstMerged, rowDup, packedShift);
+    };
+
+    // Lanes 0&1/6&7 merge into one shr each when dstStride == 2; the
+    // middle pair and straddling lanes are always processed individually.
+    bool canMergePairs = (dstStride == 2);
+    if (canMergePairs) {
+        static const int mergePairs[2][2] = {{0, 1}, {6, 7}};
+        for (auto &pr : mergePairs)
+            mergeRowPair(pr[0], pr[1], allOps[next++]);
+    }
+
+    // Straddling lanes (2, 5) use a shr/shl/or_ sequence; non-merged
+    // lanes use a single shr.
+    std::vector<int> soloLanes = {2, 3, 4, 5};
+    if (!canMergePairs)
+        soloLanes = {0, 1, 2, 3, 4, 5, 6, 7};
+    for (int lane : soloLanes) {
+        const auto &L = lanes[lane];
+        auto finalDstLane = computeFinalDstLane(lane);
+        const auto &rowLo = rows[L.byte];
+
+        if (!L.straddle) {
+            setOp(allOps[next++], Opcode::shr, nLocal, finalDstLane, rowLo, CopyOperand(int(L.shift)));
+        } else {
+            const auto &rowHi = rows[L.hiByte];
+            setOp(allOps[next++], Opcode::shr, nLocal, tmp, rowLo, CopyOperand(int(L.shift)));
+            setOp(allOps[next++], Opcode::shl, nLocal, tmpHi, rowHi, CopyOperand(int(L.hiShift)));
+            setOp(allOps[next++], Opcode::or_, nLocal, finalDstLane, tmp, tmpHi);
+        }
+    }
+
+    // Invalidate unused trailing lane slots (fewer ops needed when pair
+    // merging was used).
+    while (next < laneOps)
+        allOps[next++]->invalidate();
+
+    // Mask all unpacked elements together, then convert if necessary.
+    int totalElems = nLocal * 8;
+    auto maskDst = finalDst;
+    maskDst.stride = 1;
+    if (!directWrite) maskDst.type = DataType::uw;
+    int maskBytes = getBytes(maskDst.type);
+    int maskElems = totalElems;
+    uint32_t mask = 7;
+    if (maskDst.absByteOffset(hw) % 4 == 0
+            && (totalElems * maskBytes) % 4 == 0) {
+        maskDst.type = DataType::ud;
+        maskDst.offset = finalDst.offset * getBytes(finalDst.type) / 4;
+        maskElems = totalElems * getBytes(finalDst.type) / 4;
+        if (maskBytes == 1)
+            mask = 0x07070707;
+        else if (maskBytes == 2)
+            mask = 0x00070007;
+    }
+    setOp(allOps[next++], Opcode::and_, maskElems, maskDst, maskDst,
+            CopyOperand(Immediate::ud(mask)));
+
+    // Convert masked uw values in place when dst isn't an integer type.
+    if (!directWrite) {
+        auto realDst = finalDst;
+        realDst.stride = 1;
+        auto rawSrc = realDst;
+        rawSrc.type = DataType::uw;
+        setOp(allOps[next++], Opcode::mov, totalElems, realDst, rawSrc, CopyOperand());
+    } else
+        allOps[next++]->invalidate();
 }
 
 // Rewrite int4 -> int upconversion using byte operations.
@@ -1889,11 +2096,11 @@ void CopyPlan::planInt2Downconversion(CopyInstruction &i)
         ie[9]->src0 = tmp;
         ie[9]->src0.stride = 1;
         ie[9]->src0.type = DataType::ub;
-    } else if (ddst.stride == 2 || ddst.stride == 4) {
+    } else if (ddst.stride >= 2) {
         // Use multiple bfn instructions to insert
         // values into the destination.
         auto offset = (ddst.offset % 8) * 2;
-        int simd_factor = 8 / ddst.stride;
+        int simd_factor = std::max(1, 8 / ddst.stride);
         int new_ins = std::min(simd, simd_factor);
 
         for (int j = 0; j < new_ins; ++j) {
@@ -1906,16 +2113,17 @@ void CopyPlan::planInt2Downconversion(CopyInstruction &i)
             ie[2*j + 1]->src0.stride *= simd_factor;
             ie[2*j + 1]->src1 = Immediate::uw((offset + 2*ddst.stride*j) % 16);
 
+            const auto stride = std::max(ddst.stride / 8, 1);
             ie[2*j + 2]->op = Opcode::bfn;
             ie[2*j + 2]->simd = std::max(simd/simd_factor, 1);
             ie[2*j + 2]->ctrl = 0xCA;
             ie[2*j + 2]->dst = ddst;
             ie[2*j + 2]->dst.type = DataType::uw;
-            ie[2*j + 2]->dst.stride = 1;
+            ie[2*j + 2]->dst.stride = stride;
             ie[2*j + 2]->dst.offset /= 8;
             ie[2*j + 2]->src0 = ddst;
             ie[2*j + 2]->src0.type = DataType::uw;
-            ie[2*j + 2]->src0.stride = 1;
+            ie[2*j + 2]->src0.stride = stride;
             ie[2*j + 2]->src0.offset /= 8;
             if (offset + 2*ddst.stride*j >= 16) {
                 ie[2*j + 2]->dst.offset += 1;
@@ -2506,6 +2714,7 @@ void CopyPlan::planEmulatedHFToHF8(CopyInstruction &i)
     ie[3]->dst = CopyOperand();
     ie[3]->dst.type = DataType::hf;
     ie[3]->dst.stride = x.stride;
+    ie[3]->dst.offset = x.offset;
     ie[3]->src0 = abs(x);
     ie[3]->src1 = Immediate::hf(0x5FC0);
     ie[3]->cmod = ConditionModifier::lt;
@@ -2726,7 +2935,8 @@ void CopyPlan::checkNoSubbytes()
 {
     for (auto &i: insns)
         if ((is4(i.dst.type) && i.op != Opcode::dnscl) || is4(i.src0.type) || is4(i.src1.type) || is4(i.src2.type)
-            || isInt2(i.dst.type) || isInt2(i.src0.type) || isInt2(i.src1.type) || isInt2(i.src2.type))
+            || isInt2(i.dst.type) || isInt2(i.src0.type) || isInt2(i.src1.type) || isInt2(i.src2.type)
+            || isInt3(i.dst.type) || isInt3(i.src0.type) || isInt3(i.src1.type) || isInt3(i.src2.type))
             stub("Unexpected sub-byte type");
 }
 
@@ -4073,7 +4283,6 @@ void CopyPlan::materializeTemps(const GRFAllocator &grfAllocator, const FlagAllo
     temps.clear();
 }
 
-
 CopyResource::Kind CopyResource::makeConstant32(uint32_t c)
 {
     return static_cast<Kind>(constantBase | c);
@@ -4137,7 +4346,7 @@ int CopyPlan::cycleCount() const
 
 void CopyPlan::dump(std::ostream &os, int n, bool sortInfo) const
 {
-    for (int i = 0; i < std::min(n, (int)insns.size()); ++i) {
+    for (int i = 0; i < std::min<int>(n, insns.size()); ++i) {
         insns[i].dump(os, *this, sortInfo);
         os << std::endl;
     }

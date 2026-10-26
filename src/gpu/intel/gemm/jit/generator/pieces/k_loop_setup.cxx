@@ -126,12 +126,20 @@ bool Generator<hw>::kLoopSetup(const GEMMProblem &problem, const GEMMStrategy &s
     bool ai2D = strategy.slmA && isBlock2D(state.Ai_strategy.accessType);
     bool bi2D = strategy.slmB && isBlock2D(state.Bi_strategy.accessType);
     if (a2D || ai2D) {                              // TODO: logic doesn't look right for ai2D case
-        ka_loadRem = state.A_layout[0].nc;
+        // A u3 transpose load can span multiple sends; schedule its remainder
+        // against the merged logical block, not the first physical send.
+        ka_loadRem = (Ta_load.is3() && a2D
+                        && strategy.A.accessType == AccessType::Block2DTranspose)
+                ? state.A_layout.int3UnpackLayout()[0].nc
+                : state.A_layout[0].nc;
         if (!isColMajor(problem.A.layout))
             ka_loadRem *= state.A_layout[0].count;
     }
     if (b2D || bi2D) {
-        kb_loadRem = state.B_layout[0].nr;
+        kb_loadRem = (Tb_load.is3() && b2D
+                        && strategy.B.accessType == AccessType::Block2DTranspose)
+                ? state.B_layout.int3UnpackLayout()[0].nr
+                : state.B_layout[0].nr;
         if (isColMajor(problem.B.layout))
             kb_loadRem *= state.B_layout[0].count;
     }
@@ -342,7 +350,7 @@ bool Generator<hw>::kLoopSetup(const GEMMProblem &problem, const GEMMStrategy &s
     repackARem = repackA;
     repackBRem = repackB;
     ka_repackRem = repackA ? std::min(ka_loadRem, state.ka_repack) : 0;
-    kb_repackRem = repackB ? kb_loadRem : 0;
+    kb_repackRem = repackB ? std::min(kb_loadRem, state.kb_repack) : 0;
     if (minOPCount > 1) {
         if (ka_loadRem < minOPCount) {
             ka_repackRem = minOPCount;
@@ -395,7 +403,6 @@ void Generator<hw>::kLoopTeardown(const GEMMProblem &problem, const GEMMStrategy
     state.tokenAllocator.safeRelease(state.tokenBarrierFence[1]);
     gemmTeardownL3Prefetch(problem, strategy, state);
 }
-
 
 // Prepare for GEMM k loop with m/n masked A/B accesses. Returns true if ka_lda/kb_ldb need recalculating.
 template <HW hw>
@@ -453,7 +460,6 @@ bool Generator<hw>::gemmPrepMaskedAB(const GEMMProblem &problem, GEMMStrategy &s
     return recalc;
 }
 
-
 // Calculate kSLMA/kSLMB -- countdown variables for SLM copies.
 template <HW hw>
 void Generator<hw>::gemmCalcKSLM(const Subregister &kSLM, const Subregister &lid, int kgran, int kdiv, int krep,
@@ -461,9 +467,9 @@ void Generator<hw>::gemmCalcKSLM(const Subregister &kSLM, const Subregister &lid
 {
     if (kBase.isInvalid()) kBase = state.K;
 
-    if (kdiv == 1)
+    if (kdiv == 1) {
         mov(1, kSLM, kBase);
-    else {
+    } else {
         auto modLID = lid;
         if (krep > 1) {
             if (!is_zero_or_pow2(krep)) stub();
@@ -558,10 +564,11 @@ void Generator<hw>::gemmCalcKLoopBarrierCount(Subregister &count, const Subregis
             maySkipSplitBarrier ? add(1 | state.flagAP, count, count, 1)
                                 : add(1,                count, count, 1);
         }
-    } else if (strategy.slmBuffers > 0) {
+    } else if (std::max(strategy.slmBuffersA, strategy.slmBuffersB) > 0) {
+        // TODO: Check if this needs to change for different slmBuffer sizes.
         if (!is_zero_or_pow2(unrollKSLM)) stub();
 
-        if (strategy.slmBuffers == 1) {
+        if (std::max(strategy.slmBuffersA, strategy.slmBuffersB) == 1) {
             add(1 | sat, count, k, unrollKSLM - 1);
             if (unrollKSLM == 2)
                 and_(1, count, count, ~uint32_t(1));
